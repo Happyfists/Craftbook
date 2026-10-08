@@ -14,7 +14,7 @@
 
 addon.name    = 'craftbook';
 addon.author  = 'Happys';
-addon.version = '3.0';
+addon.version = '3.1';
 addon.desc    = 'Shows what you can craft from your inventory and mog house, and where every ingredient is.';
 addon.link    = 'https://github.com/Happyfists/Craftbook';
 
@@ -149,7 +149,9 @@ local state = {
 ----------------------------------------------------------------------------------------------------
 
 local function flag(name)
-    local v = _G[name];
+    local ok, env = pcall(getfenv, 1);
+    local v = (ok and type(env) == 'table') and env[name] or nil;
+    if type(v) ~= 'number' then v = _G[name]; end
     if type(v) == 'number' then return v; end
     return 0;
 end
@@ -482,11 +484,11 @@ local function push_theme()
     local colors, vars = 0, 0;
 
     local function col(name, value)
-        local id = _G[name];
+        local id = flag(name); if id == 0 and name ~= 'ImGuiCol_Text' then id = nil; end
         if type(id) == 'number' then imgui.PushStyleColor(id, value); colors = colors + 1; end
     end
     local function var(name, value)
-        local id = _G[name];
+        local id = flag(name); if id == 0 and name ~= 'ImGuiStyleVar_Alpha' then id = nil; end
         if type(id) == 'number' then imgui.PushStyleVar(id, value); vars = vars + 1; end
     end
 
@@ -661,7 +663,7 @@ local function expanding_list(key, count, sel, draw_row, draw_extra)
     imgui.Dummy({ 1, 0 });
 end
 
-local LEFT_WIDTH = 300;
+local LEFT_WIDTH = 340;
 
 local function line_height()
     local ok, h = pcall(imgui.GetTextLineHeightWithSpacing);
@@ -674,10 +676,33 @@ local function font_scale(s)
     pcall(imgui.SetWindowFontScale, s);
 end
 
-local function short_name(name, max)
-    if #name > max then return name:sub(1, max - 2) .. '..'; end
-    return name;
+-- Width of a piece of text in pixels at the current font size.
+local function text_width(s)
+    local ok, a = pcall(imgui.CalcTextSize, s);
+    if ok then
+        if type(a) == 'number' then return a; end
+        if type(a) == 'table' then return a.x or a[1] or 0; end
+        if type(a) == 'userdata' then
+            local okx, x = pcall(function () return a.x; end);
+            if okx and type(x) == 'number' then return x; end
+        end
+    end
+    return #s * 9; -- rough guess if it cannot be measured
 end
+
+-- Shortens text with '..' so it fits in maxw pixels.
+local function fit(s, maxw)
+    if maxw <= 0 then return ''; end
+    if text_width(s) <= maxw then return s; end
+    local lo, hi = 0, #s;
+    while lo < hi do
+        local mid = math.floor((lo + hi + 1) / 2);
+        if text_width(s:sub(1, mid) .. '..') <= maxw then lo = mid; else hi = mid - 1; end
+    end
+    return s:sub(1, lo) .. '..';
+end
+
+local SCROLLBAR = 18; -- room kept free on the right of lists for the scrollbar
 
 local function status_tail(r)
     if r.status == 3 then return string.format('need %d', r.missing); end
@@ -698,22 +723,39 @@ end
 ----------------------------------------------------------------------------------------------------
 
 -- One list row: status dot, name, level, how many you can make.
+-- Column positions for list rows, measured from the real font so nothing overlaps.
+local function row_layout(w, show_craft)
+    local right = w - SCROLLBAR;
+    local tail_w = text_width('need 99');
+    local mid_w = text_width(show_craft and 'Leather 110' or 'Lv 110');
+    local gap = 10;
+    return {
+        right    = right,
+        tail_x   = right - tail_w,
+        mid_end  = right - tail_w - gap,
+        mid_w    = mid_w,
+        name_max = right - tail_w - gap - mid_w - gap - text_width('  ') - 16,
+    };
+end
+
+-- Right-aligns text so it ends at x_end.
+local function text_right(x_end, color, text)
+    imgui.SameLine(math.max(0, x_end - text_width(text)));
+    imgui.TextColored(color, text);
+end
+
 local function draw_recipe_row(r, selected, w, id_prefix, show_craft)
+    local L = row_layout(w, show_craft);
     local c = status_color(r);
     imgui.PushStyleColor(flag('ImGuiCol_Text'), c);
     imgui.Bullet();
     imgui.PopStyleColor(1);
     imgui.SameLine();
-    local name = short_name((r.desynth and 'Desynth ' or '') .. r.name, show_craft and 16 or 20);
+    local name = fit((r.desynth and 'Desynth ' or '') .. r.name, L.name_max);
     local clicked = imgui.Selectable(string.format('%s##%s%d', name, id_prefix, r.id), selected);
-    imgui.SameLine(w - (show_craft and 128 or 108));
-    if show_craft then
-        imgui.TextColored(COLOR.dim, string.format('%s %d', CRAFT_SHORT[r.craft], r.level));
-    else
-        imgui.TextColored(COLOR.dim, string.format('Lv %d', r.level));
-    end
-    imgui.SameLine(w - 58);
-    imgui.TextColored(c, status_tail(r));
+    local mid = show_craft and string.format('%s %d', CRAFT_SHORT[r.craft], r.level) or string.format('Lv %d', r.level);
+    text_right(L.mid_end, COLOR.dim, mid);
+    text_right(L.right, c, status_tail(r));
     return clicked;
 end
 
@@ -750,12 +792,11 @@ end
 -- A craft section header: click to open or close it.
 local function draw_craft_header(row, w)
     imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.head);
+    local L = row_layout(w, false);
     local clicked = imgui.Selectable(string.format('%s %s##craft%d', row.open and '[-]' or '[+]', CRAFTS[row.craft], row.craft), false);
     imgui.PopStyleColor(1);
-    imgui.SameLine(w - 108);
-    imgui.TextColored(COLOR.dim, tostring(row.count));
-    imgui.SameLine(w - 58);
-    imgui.TextColored(row.ready > 0 and COLOR.ready or COLOR.dim, string.format('%d rdy', row.ready));
+    text_right(L.mid_end, COLOR.dim, tostring(row.count));
+    text_right(L.right, row.ready > 0 and COLOR.ready or COLOR.dim, string.format('%d rdy', row.ready));
     return clicked;
 end
 
@@ -924,7 +965,7 @@ local function draw_recipe_detail(r, dw)
 
     -- Title and the "can make" badge.
     font_scale(1.45);
-    imgui.TextColored(COLOR.text_main or COLOR.head, short_name((r.desynth and 'Desynth ' or '') .. r.name, 26));
+    imgui.TextColored(COLOR.text_main or COLOR.head, fit((r.desynth and 'Desynth ' or '') .. r.name, dw - 70));
     font_scale(1.0);
     draw_close_button(dw);
 
@@ -936,7 +977,7 @@ local function draw_recipe_detail(r, dw)
         end
     end
     if r.crystal ~= 0 then sub[#sub + 1] = item_name(r.crystal); end
-    imgui.TextColored(COLOR.dim, table.concat(sub, ' - '));
+    imgui.TextColored(COLOR.dim, fit(table.concat(sub, ' - '), dw - 130));
 
     imgui.SameLine(dw - 100);
     imgui.PushStyleColor(flag('ImGuiCol_Border'), c);
@@ -963,10 +1004,11 @@ local function draw_recipe_detail(r, dw)
         if i % 2 == 0 then imgui.SameLine(); end
         imgui.PushStyleColor(flag('ImGuiCol_Border'), t.c);
         imgui.BeginChild('##tile' .. i, { tw, th }, true);
-        imgui.TextColored(t.c, short_name(item_name(t.n.id), 18));
-        imgui.SameLine(tw - 64);
-        imgui.TextColored(t.c, string.format('%d / %d', t.total, t.n.count));
-        for _, l in ipairs(t.lines) do imgui.TextColored(l[1], l[2]); end
+        local count = string.format('%d / %d', t.total, t.n.count);
+        local inner = tw - 24; -- tile padding on both sides
+        imgui.TextColored(t.c, fit(item_name(t.n.id), inner - text_width(count) - 12));
+        text_right(12 + inner, t.c, count);
+        for _, l in ipairs(t.lines) do imgui.TextColored(l[1], fit(l[2], inner)); end
         imgui.EndChild();
         imgui.PopStyleColor(1);
     end
@@ -1023,11 +1065,13 @@ local function draw_item_list(w)
     if #list == 0 then imgui.TextColored(COLOR.dim, 'No items to show.'); end
     expanding_list('items', #list, nil, function (i)
         local it = list[i];
-        if imgui.Selectable(string.format('%s##i%d', short_name(it.name, 22), it.id), state.selected_item == it.id) then
+        local right = cw - SCROLLBAR;
+        local count = string.format('x%d', it.total);
+        local name = fit(it.name, right - text_width('x9999') - 16);
+        if imgui.Selectable(string.format('%s##i%d', name, it.id), state.selected_item == it.id) then
             state.selected_item = it.id;
         end
-        imgui.SameLine(cw - 58);
-        imgui.Text(string.format('x%d', it.total));
+        text_right(right, COLOR.text_main or COLOR.dim, count);
     end, function () end);
     imgui.EndChild();
     imgui.TextColored(COLOR.dim, string.format('%d items', #state.items));
@@ -1043,7 +1087,7 @@ local function draw_item_detail(dw)
     end
 
     font_scale(1.45);
-    imgui.TextColored(COLOR.text_main or COLOR.head, short_name(item_name(id), 26));
+    imgui.TextColored(COLOR.text_main or COLOR.head, fit(item_name(id), dw - 70));
     font_scale(1.0);
     draw_close_button(dw);
 
@@ -1143,7 +1187,6 @@ end
 ----------------------------------------------------------------------------------------------------
 
 local TABS = { 'Recipes', 'Items', 'Settings' };
-local TAB_WIDTH = { 58, 42, 62 };
 
 local function draw_header()
     imgui.TextColored(COLOR.head, 'Craftbook');
@@ -1151,7 +1194,7 @@ local function draw_header()
         imgui.SameLine();
         local active = (state.tab == i);
         if not active then imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.dim); end
-        if imgui.Selectable(name .. '##tab', active, 0, { TAB_WIDTH[i], 0 }) then state.tab = i; end
+        if imgui.Selectable(name .. '##tab', active, 0, { text_width(name) + 4, 0 }) then state.tab = i; end
         if not active then imgui.PopStyleColor(1); end
     end
     imgui.Separator();
@@ -1168,7 +1211,8 @@ local function draw()
 
     local pushed_colors, pushed_vars = push_theme();
     imgui.SetNextWindowSize({ 880, 560 }, flag('ImGuiCond_FirstUseEver'));
-    if imgui.Begin('Craftbook##craftbook_workshop', nil, flag('ImGuiWindowFlags_NoTitleBar')) then
+    state.open[1] = true;
+    if imgui.Begin('Craftbook##craftbook_workshop', state.open, flag('ImGuiWindowFlags_NoTitleBar')) then
         -- Left pane: tabs, filters and the list.
         imgui.BeginChild('##left', { LEFT_WIDTH, 0 }, true);
         draw_header();
@@ -1204,6 +1248,11 @@ local function draw()
     end
     imgui.End();
     pop_theme(pushed_colors, pushed_vars);
+
+    if not state.open[1] then
+        cfg.visible = false;
+        settings.save();
+    end
 end
 
 ----------------------------------------------------------------------------------------------------
