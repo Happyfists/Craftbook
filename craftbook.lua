@@ -14,7 +14,7 @@
 
 addon.name    = 'craftbook';
 addon.author  = 'Happys';
-addon.version = '2.1';
+addon.version = '3.0';
 addon.desc    = 'Shows what you can craft from your inventory and mog house, and where every ingredient is.';
 addon.link    = 'https://github.com/Happyfists/Craftbook';
 
@@ -94,6 +94,7 @@ local default_settings = T{
     skill_margin = 10,
     mats_only    = true,
     theme        = 1,
+    open_crafts  = T{ c1 = false, c2 = false, c3 = false, c4 = false, c5 = false, c6 = false, c7 = false, c8 = false },
     opacity      = 94,
     bags = T{
         b0 = true, b1 = true, b2 = true, b4 = true, b5 = true, b6 = true, b7 = true, b8 = true, b9 = true,
@@ -128,6 +129,8 @@ local state = {
     tab           = 1,     -- 1 recipes, 2 items, 3 settings
     extra_h       = {},    -- measured height of the expanded row per list
     sel_idx       = nil,
+    rows          = {},    -- what the recipe list shows: craft headers and recipes
+    rows_dirty    = true,
     item_idx      = nil,
     selected      = nil,   -- selected recipe (Recipes tab)
     selected_item = nil,   -- selected item id (Items tab)
@@ -450,6 +453,7 @@ end
 
 -- Each theme is a small palette; the window style is built from it in push_theme().
 local THEMES = {
+    { name = 'Workshop',      bg = { 0.106, 0.102, 0.094 }, panel = { 0.137, 0.129, 0.125 }, frame = { 0.200, 0.188, 0.172 }, accent = { 0.94, 0.65, 0.23 }, text = { 0.94, 0.92, 0.89 }, border = { 0.35, 0.29, 0.18 }, border_w = 1 },
     { name = 'Vana blue',     bg = { 0.043, 0.102, 0.227 }, panel = { 0.043, 0.102, 0.227 }, frame = { 0.090, 0.188, 0.416 }, accent = { 0.50, 0.85, 1.00 }, text = { 0.95, 0.96, 1.00 }, border = { 0.79, 0.84, 0.95 }, flat = true },
     { name = 'Midnight gold', bg = { 0.06, 0.07, 0.12 }, panel = { 0.10, 0.12, 0.19 }, frame = { 0.16, 0.19, 0.30 }, accent = { 0.86, 0.68, 0.28 }, text = { 0.93, 0.91, 0.84 } },
     { name = 'Forest',        bg = { 0.06, 0.10, 0.08 }, panel = { 0.09, 0.15, 0.12 }, frame = { 0.14, 0.24, 0.18 }, accent = { 0.55, 0.82, 0.45 }, text = { 0.90, 0.94, 0.88 } },
@@ -534,7 +538,7 @@ local function push_theme()
     var('ImGuiStyleVar_ScrollbarRounding', 8);
     var('ImGuiStyleVar_GrabRounding',      6);
     var('ImGuiStyleVar_TabRounding',       6);
-    var('ImGuiStyleVar_WindowBorderSize',  t.border and 2 or 1);
+    var('ImGuiStyleVar_WindowBorderSize',  t.border_w or (t.border and 2 or 1));
     var('ImGuiStyleVar_ChildBorderSize',   1);
     var('ImGuiStyleVar_WindowPadding',     { 12, 10 });
     var('ImGuiStyleVar_FramePadding',      { 6, 3 });
@@ -549,6 +553,7 @@ local function push_theme()
         COLOR.dim = rgba(t.text, 0.60);
     end
     COLOR.head = rgba(t.accent);
+    COLOR.text_main = rgba(t.text);
     return colors, vars;
 end
 
@@ -558,6 +563,7 @@ local function pop_theme(colors, vars)
     if cfg.theme == 0 then
         COLOR.ready, COLOR.fetch, COLOR.missing = { 0.45, 1.00, 0.45, 1 }, { 1.00, 0.85, 0.30, 1 }, { 1.00, 0.45, 0.45, 1 };
         COLOR.dim, COLOR.head = { 0.65, 0.65, 0.65, 1 }, { 0.60, 0.80, 1.00, 1 };
+        COLOR.text_main = nil;
     end
 end
 
@@ -655,130 +661,124 @@ local function expanding_list(key, count, sel, draw_row, draw_extra)
     imgui.Dummy({ 1, 0 });
 end
 
+local LEFT_WIDTH = 300;
+
+local function line_height()
+    local ok, h = pcall(imgui.GetTextLineHeightWithSpacing);
+    if ok and type(h) == 'number' and h > 0 then return h; end
+    return 17;
+end
+
+-- Bigger text for titles and counts; ignored if this imgui build cannot scale fonts.
+local function font_scale(s)
+    pcall(imgui.SetWindowFontScale, s);
+end
+
+local function short_name(name, max)
+    if #name > max then return name:sub(1, max - 2) .. '..'; end
+    return name;
+end
+
 local function status_tail(r)
     if r.status == 3 then return string.format('need %d', r.missing); end
     return string.format('x%d', r.times);
 end
 
--- One compact row: status dot, name, craft and level, how many you can make.
-local function draw_recipe_row(r, selected, w, id_prefix)
+-- The best recipe that makes an item, for "you can craft it" hints.
+local function best_maker(id)
+    local best = nil;
+    for _, s in ipairs(makes[id] or {}) do
+        if cfg.eras[s.era] and (best == nil or s.status < best.status) then best = s; end
+    end
+    return best;
+end
+
+----------------------------------------------------------------------------------------------------
+-- Left pane: recipe list
+----------------------------------------------------------------------------------------------------
+
+-- One list row: status dot, name, level, how many you can make.
+local function draw_recipe_row(r, selected, w, id_prefix, show_craft)
     local c = status_color(r);
     imgui.PushStyleColor(flag('ImGuiCol_Text'), c);
     imgui.Bullet();
     imgui.PopStyleColor(1);
     imgui.SameLine();
-    local label = string.format('%s%s##%s%d', r.desynth and 'Desynth ' or '', r.name, id_prefix, r.id);
-    local clicked = imgui.Selectable(label, selected);
-    imgui.SameLine(w - 170);
-    imgui.TextColored(COLOR.dim, string.format('%s %d', CRAFT_SHORT[r.craft], r.level));
-    imgui.SameLine(w - 78);
+    local name = short_name((r.desynth and 'Desynth ' or '') .. r.name, show_craft and 16 or 20);
+    local clicked = imgui.Selectable(string.format('%s##%s%d', name, id_prefix, r.id), selected);
+    imgui.SameLine(w - (show_craft and 128 or 108));
+    if show_craft then
+        imgui.TextColored(COLOR.dim, string.format('%s %d', CRAFT_SHORT[r.craft], r.level));
+    else
+        imgui.TextColored(COLOR.dim, string.format('Lv %d', r.level));
+    end
+    imgui.SameLine(w - 58);
     imgui.TextColored(c, status_tail(r));
     return clicked;
 end
 
--- The lines shown under an expanded recipe.
-local function draw_recipe_extra(r, w)
-    imgui.Indent(20);
-
-    for _, n in ipairs(r.need) do
-        local h = have[n.id];
-        local total = (h and h.total) or 0;
-        local inbag = (h and h.bags[0]) or 0;
-        local c = (total < n.count and COLOR.missing) or (inbag < n.count and COLOR.fetch) or COLOR.ready;
-        imgui.TextColored(c, item_name(n.id));
-        imgui.SameLine(math.max(150, w * 0.36));
-        imgui.Text(string.format('%d / %d', total, n.count));
-        imgui.SameLine(math.max(205, w * 0.48));
-        if total > 0 then
-            imgui.PushStyleColor(flag('ImGuiCol_Text'), (inbag < n.count) and c or COLOR.dim);
-            imgui.TextWrapped(where_text(n.id));
-            imgui.PopStyleColor(1);
-        else
-            -- Point out when a missing ingredient is itself something you could craft.
-            local hint = 'you have none';
-            local sub = makes[n.id];
-            if sub ~= nil then
-                local best = nil;
-                for _, s in ipairs(sub) do
-                    if cfg.eras[s.era] and (best == nil or s.status < best.status) then best = s; end
+-- Builds the rows of the recipe list. With "All crafts" picked and nothing typed in the
+-- search box, recipes are grouped under a header per craft that opens and closes.
+local function build_rows()
+    local rows = {};
+    local searching = (state.search[1] or '') ~= '';
+    if cfg.craft ~= 0 or searching then
+        for _, r in ipairs(state.filtered) do rows[#rows + 1] = { r = r }; end
+    else
+        local groups = {};
+        for i = 1, #CRAFTS do groups[i] = {}; end
+        for _, r in ipairs(state.filtered) do table.insert(groups[r.craft], r); end
+        for i = 1, #CRAFTS do
+            local g = groups[i];
+            if #g > 0 then
+                local ready = 0;
+                for _, r in ipairs(g) do
+                    if r.status == 1 then ready = ready + 1; end
                 end
-                if best ~= nil then
-                    local st = (best.status == 1 and 'ready') or (best.status == 2 and 'have mats') or string.format('need %d', best.missing);
-                    hint = string.format('none - craft it: %s %d (%s)', CRAFT_SHORT[best.craft], best.level, st);
+                local open = cfg.open_crafts['c' .. i] == true;
+                rows[#rows + 1] = { header = true, craft = i, count = #g, ready = ready, open = open };
+                if open then
+                    for _, r in ipairs(g) do rows[#rows + 1] = { r = r }; end
                 end
             end
-            imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.dim);
-            imgui.TextWrapped(hint);
-            imgui.PopStyleColor(1);
         end
     end
+    state.rows = rows;
+    state.rows_dirty = false;
+end
 
-    -- Skill requirements
-    for i = 1, 8 do
-        local req = r.skills[i] or 0;
-        if req > 0 then
-            local mine = skills[i];
-            if mine == nil then
-                imgui.TextColored(COLOR.dim, string.format('%s %d', CRAFTS[i], req));
-            else
-                local c = (mine >= req and COLOR.dim) or (mine + 10 >= req and COLOR.fetch) or COLOR.missing;
-                imgui.TextColored(c, string.format('%s %d - your skill %d', CRAFTS[i], req, mine));
-            end
-        end
-    end
-
-    if r.ki ~= 0 then
-        local k = has_keyitem(r.ki);
-        local c = (k == true and COLOR.ready) or (k == false and COLOR.missing) or COLOR.dim;
-        local note = (k == true and 'you have it') or (k == false and 'you do not have it') or 'could not check';
-        imgui.PushStyleColor(flag('ImGuiCol_Text'), c);
-        imgui.TextWrapped(string.format('Key item: %s (%s)', keyitem_name(r.ki), note));
-        imgui.PopStyleColor(1);
-    end
-
-    local q = r.qty;
-    local parts = {};
-    if r.crystal ~= 0 then parts[#parts + 1] = item_name(r.crystal); end
-    parts[#parts + 1] = string.format('makes %s x%d', item_name(r.results[1] or 0), q[1] or 1);
-    for i = 2, 4 do
-        local id = r.results[i] or 0;
-        if id ~= 0 and (id ~= r.results[1] or (q[i] or 1) ~= (q[1] or 1)) then
-            parts[#parts + 1] = string.format('HQ%d %s x%d', i - 1, item_name(id), q[i] or 1);
-        end
-    end
-    imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.dim);
-    imgui.TextWrapped(table.concat(parts, ' - '));
+-- A craft section header: click to open or close it.
+local function draw_craft_header(row, w)
+    imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.head);
+    local clicked = imgui.Selectable(string.format('%s %s##craft%d', row.open and '[-]' or '[+]', CRAFTS[row.craft], row.craft), false);
     imgui.PopStyleColor(1);
-
-    imgui.Unindent(20);
-    imgui.Separator();
+    imgui.SameLine(w - 108);
+    imgui.TextColored(COLOR.dim, tostring(row.count));
+    imgui.SameLine(w - 58);
+    imgui.TextColored(row.ready > 0 and COLOR.ready or COLOR.dim, string.format('%d rdy', row.ready));
+    return clicked;
 end
 
-local function index_of(list, value)
-    if value == nil then return nil; end
-    for i, v in ipairs(list) do
-        if v == value then return i; end
-    end
-    return nil;
-end
-
-local function draw_recipes_tab(w)
+local function draw_recipe_list(w)
     local changed, c;
 
     -- Look up anything you want to craft.
-    imgui.PushItemWidth(math.max(120, w - 24 - 96));
-    imgui.InputText('Find recipe', state.search, 64);
+    imgui.PushItemWidth(w - 24);
+    imgui.InputText('##find', state.search, 64);
     imgui.PopItemWidth();
+    if (state.search[1] or '') == '' then
+        imgui.SameLine(18);
+        imgui.TextColored(COLOR.dim, 'Find a recipe...');
+    end
 
-    imgui.PushItemWidth(math.max(120, w - 24 - 112 - 96 - 16));
+    imgui.PushItemWidth(w - 24);
     cfg.show_mode, c = combo('##show', cfg.show_mode, SHOW_MODES); changed = c;
     imgui.PopItemWidth();
-    imgui.SameLine();
-    imgui.PushItemWidth(112);
+    imgui.PushItemWidth(math.floor((w - 24 - 8) * 0.55));
     cfg.craft, c = combo('##craft', cfg.craft, CRAFTS, 'All crafts'); changed = changed or c;
     imgui.PopItemWidth();
     imgui.SameLine();
-    imgui.PushItemWidth(96);
+    imgui.PushItemWidth(math.floor((w - 24 - 8) * 0.45));
     cfg.level, c = combo('##level', cfg.level, LEVELS, 'All levels'); changed = changed or c;
     imgui.PopItemWidth();
 
@@ -798,50 +798,215 @@ local function draw_recipes_tab(w)
                 state.selected = first;
             end
         end
-        state.sel_idx = index_of(state.filtered, state.selected);
+        state.rows_dirty = true;
     end
+    if state.rows_dirty then build_rows(); end
 
     imgui.Separator();
 
-    imgui.BeginChild('##recipe_list', { 0, -26 }, false);
-    local list = state.filtered;
-    local cw = window_width(w - 24);
+    imgui.BeginChild('##recipe_list', { 0, -24 }, false);
+    local list = state.rows;
+    local cw = window_width(w - 16);
     if #list == 0 then
         if not state.logged_in then
-            imgui.TextColored(COLOR.dim, 'No items found yet. Log in to a character.');
+            imgui.TextColored(COLOR.dim, 'No items found yet.');
+            imgui.TextColored(COLOR.dim, 'Log in to a character.');
+        elseif (state.search[1] or '') ~= '' then
+            imgui.TextColored(COLOR.dim, 'No recipe with that name.');
         else
-            imgui.TextColored(COLOR.dim, (state.search[1] or '') ~= '' and 'No recipe with that name.' or 'Nothing matches. Try another filter.');
+            imgui.TextColored(COLOR.dim, 'Nothing matches these filters.');
         end
     end
-    expanding_list('recipes', #list, state.sel_idx, function (i)
-        local r = list[i];
-        if draw_recipe_row(r, state.selected == r, cw, 'r') then
-            if state.selected == r then
-                state.selected, state.sel_idx = nil, nil;
-            else
-                state.selected, state.sel_idx = r, i;
+    local show_craft = (cfg.craft == 0 and (state.search[1] or '') ~= '');
+    expanding_list('recipes', #list, nil, function (i)
+        local row = list[i];
+        if row.header then
+            if draw_craft_header(row, cw) then
+                local key = 'c' .. row.craft;
+                cfg.open_crafts[key] = not (cfg.open_crafts[key] == true);
+                settings.save();
+                state.rows_dirty = true; -- rebuilt next frame, not while drawing
             end
+            return;
         end
-    end, function (i)
-        draw_recipe_extra(list[i], cw);
-    end);
+        if draw_recipe_row(row.r, state.selected == row.r, cw, 'r', show_craft) then
+            state.selected = row.r;
+        end
+    end, function () end);
     imgui.EndChild();
 
-    imgui.Separator();
-    imgui.TextColored(COLOR.dim, string.format((state.search[1] or '') ~= '' and '%d found' or '%d recipe(s)', #state.filtered));
-    imgui.SameLine();
-    imgui.TextColored(COLOR.ready, 'ready');
-    imgui.SameLine();
-    imgui.TextColored(COLOR.fetch, 'in another bag');
-    imgui.SameLine();
-    imgui.TextColored(COLOR.missing, 'missing');
+    imgui.TextColored(COLOR.dim, string.format((state.search[1] or '') ~= '' and '%d found' or '%d recipes', #state.filtered));
 end
 
-local function draw_items_tab(w)
+----------------------------------------------------------------------------------------------------
+-- Right pane: recipe detail
+----------------------------------------------------------------------------------------------------
+
+-- What to do before you can synth: items to move, items to get, key items, skill.
+local function todo_lines(r)
+    local out = {};
+    for _, n in ipairs(r.need) do
+        local h = have[n.id];
+        local total = (h and h.total) or 0;
+        local inbag = (h and h.bags[0]) or 0;
+        local name = item_name(n.id);
+        if total < n.count then
+            local text = string.format('Get %d more %s', n.count - total, name);
+            local best = best_maker(n.id);
+            if best ~= nil then
+                text = text .. string.format(' (craftable: %s %d)', CRAFT_SHORT[best.craft], best.level);
+            end
+            out[#out + 1] = { COLOR.missing, text };
+        elseif inbag < n.count then
+            local short = n.count - inbag;
+            for _, bag in ipairs(BAGS) do
+                local cnt = (bag.id ~= 0) and h.bags[bag.id] or nil;
+                if cnt ~= nil and short > 0 then
+                    local take = math.min(short, cnt);
+                    out[#out + 1] = { COLOR.fetch, string.format('Move %d %s from %s', take, name, bag.name) };
+                    short = short - take;
+                end
+            end
+        end
+    end
+    if r.ki ~= 0 and r.ki_missing then
+        out[#out + 1] = { COLOR.missing, 'Get the key item: ' .. keyitem_name(r.ki) };
+    end
+    for i = 1, 8 do
+        local req, mine = r.skills[i] or 0, skills[i];
+        if req > 0 and mine ~= nil and mine < req then
+            out[#out + 1] = { (mine + 10 >= req) and COLOR.fetch or COLOR.missing,
+                string.format('Your %s is %d, this recipe is %d', CRAFTS[i], mine, req) };
+        end
+    end
+    if #out == 0 then
+        out[1] = { COLOR.ready, 'Everything is in your Inventory - ready to synth.' };
+    end
+    return out;
+end
+
+-- One ingredient tile: name and have / need on top, where it is underneath.
+local function tile_lines(n)
+    local h = have[n.id];
+    local total = (h and h.total) or 0;
+    local inbag = (h and h.bags[0]) or 0;
+    local c = (total < n.count and COLOR.missing) or (inbag < n.count and COLOR.fetch) or COLOR.ready;
+    local lines = {};
+    if total == 0 then
+        local best = best_maker(n.id);
+        lines[1] = { COLOR.dim, 'you have none' };
+        if best ~= nil then
+            lines[2] = { COLOR.dim, string.format('craftable: %s %d', CRAFT_SHORT[best.craft], best.level) };
+        end
+    else
+        for _, bag in ipairs(BAGS) do
+            local cnt = h.bags[bag.id];
+            if cnt ~= nil then
+                lines[#lines + 1] = { (bag.id == 0) and COLOR.dim or c, string.format('%s x%d', bag.name, cnt) };
+            end
+        end
+        if inbag == 0 then lines[#lines + 1] = { COLOR.dim, 'none in Inventory' }; end
+    end
+    return c, total, lines;
+end
+
+local function draw_close_button(dw)
+    imgui.SameLine(dw - 30);
+    if imgui.SmallButton('x##close') then
+        cfg.visible = false;
+        settings.save();
+    end
+end
+
+local function draw_recipe_detail(r, dw)
+    local c = status_color(r);
+    local lh = line_height();
+
+    -- Title and the "can make" badge.
+    font_scale(1.45);
+    imgui.TextColored(COLOR.text_main or COLOR.head, short_name((r.desynth and 'Desynth ' or '') .. r.name, 26));
+    font_scale(1.0);
+    draw_close_button(dw);
+
+    local sub = {};
+    for i = 1, 8 do
+        local req = r.skills[i] or 0;
+        if req > 0 then
+            sub[#sub + 1] = (skills[i] ~= nil) and string.format('%s %d (you %d)', CRAFTS[i], req, skills[i]) or string.format('%s %d', CRAFTS[i], req);
+        end
+    end
+    if r.crystal ~= 0 then sub[#sub + 1] = item_name(r.crystal); end
+    imgui.TextColored(COLOR.dim, table.concat(sub, ' - '));
+
+    imgui.SameLine(dw - 100);
+    imgui.PushStyleColor(flag('ImGuiCol_Border'), c);
+    imgui.BeginChild('##badge', { 88, lh * 2 + 18 }, true);
+    font_scale(1.35);
+    imgui.TextColored(c, (r.status == 3) and string.format('-%d', r.missing) or string.format('x%d', r.times));
+    font_scale(1.0);
+    imgui.TextColored(COLOR.dim, (r.status == 3) and 'missing' or 'can make');
+    imgui.EndChild();
+    imgui.PopStyleColor(1);
+
+    -- Ingredients, two tiles per row.
+    imgui.TextColored(COLOR.head, 'INGREDIENTS');
+    local tw = math.floor((dw - 24 - 8) / 2);
+    local tiles = {};
+    for i, n in ipairs(r.need) do
+        local tc, total, lines = tile_lines(n);
+        tiles[i] = { n = n, c = tc, total = total, lines = lines };
+    end
+    for i, t in ipairs(tiles) do
+        local partner = (i % 2 == 1) and tiles[i + 1] or tiles[i - 1];
+        local rows_needed = math.max(#t.lines, partner and #partner.lines or 0, 1) + 1;
+        local th = rows_needed * lh + 16;
+        if i % 2 == 0 then imgui.SameLine(); end
+        imgui.PushStyleColor(flag('ImGuiCol_Border'), t.c);
+        imgui.BeginChild('##tile' .. i, { tw, th }, true);
+        imgui.TextColored(t.c, short_name(item_name(t.n.id), 18));
+        imgui.SameLine(tw - 64);
+        imgui.TextColored(t.c, string.format('%d / %d', t.total, t.n.count));
+        for _, l in ipairs(t.lines) do imgui.TextColored(l[1], l[2]); end
+        imgui.EndChild();
+        imgui.PopStyleColor(1);
+    end
+
+    -- What still needs doing.
+    imgui.TextColored(COLOR.head, 'TO DO');
+    for _, l in ipairs(todo_lines(r)) do
+        imgui.PushStyleColor(flag('ImGuiCol_Text'), l[1]);
+        imgui.TextWrapped(l[2]);
+        imgui.PopStyleColor(1);
+    end
+
+    -- Results
+    imgui.Separator();
+    local q = r.qty;
+    local parts = { string.format('Makes: %s x%d', item_name(r.results[1] or 0), q[1] or 1) };
+    for i = 2, 4 do
+        local id = r.results[i] or 0;
+        if id ~= 0 and (id ~= r.results[1] or (q[i] or 1) ~= (q[1] or 1)) then
+            parts[#parts + 1] = string.format('HQ%d %s x%d', i - 1, item_name(id), q[i] or 1);
+        end
+    end
+    imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.dim);
+    imgui.TextWrapped(table.concat(parts, '   '));
+    imgui.PopStyleColor(1);
+end
+
+----------------------------------------------------------------------------------------------------
+-- Items tab
+----------------------------------------------------------------------------------------------------
+
+local function draw_item_list(w)
     local c;
-    imgui.PushItemWidth(math.max(120, w - 24 - 60));
-    imgui.InputText('Search', state.item_search, 64);
+    imgui.PushItemWidth(w - 24);
+    imgui.InputText('##itemfind', state.item_search, 64);
     imgui.PopItemWidth();
+    if (state.item_search[1] or '') == '' then
+        imgui.SameLine(18);
+        imgui.TextColored(COLOR.dim, 'Find an item...');
+    end
     cfg.mats_only, c = checkbox('Only crafting materials', cfg.mats_only);
     if c then settings.save(); state.items_dirty = true; end
 
@@ -849,83 +1014,83 @@ local function draw_items_tab(w)
         state.last_ifilter = state.item_search[1];
         state.items_dirty = true;
     end
-    if state.items_dirty then
-        rebuild_items();
-        state.item_idx = nil;
-        for i, it in ipairs(state.items) do
-            if it.id == state.selected_item then state.item_idx = i; break; end
-        end
-    end
+    if state.items_dirty then rebuild_items(); end
 
     imgui.Separator();
-
-    imgui.BeginChild('##item_list', { 0, -26 }, false);
+    imgui.BeginChild('##item_list', { 0, -24 }, false);
     local list = state.items;
-    local cw = window_width(w - 24);
-    if #list == 0 then
-        imgui.TextColored(COLOR.dim, 'No items to show.');
-    end
-    local jump = nil;
-    expanding_list('items', #list, state.item_idx, function (i)
+    local cw = window_width(w - 16);
+    if #list == 0 then imgui.TextColored(COLOR.dim, 'No items to show.'); end
+    expanding_list('items', #list, nil, function (i)
         local it = list[i];
-        if imgui.Selectable(string.format('%s##i%d', it.name, it.id), state.selected_item == it.id) then
-            if state.selected_item == it.id then
-                state.selected_item, state.item_idx = nil, nil;
-            else
-                state.selected_item, state.item_idx = it.id, i;
-            end
+        if imgui.Selectable(string.format('%s##i%d', short_name(it.name, 22), it.id), state.selected_item == it.id) then
+            state.selected_item = it.id;
         end
-        imgui.SameLine(cw - 170);
-        imgui.TextColored(COLOR.dim, string.format('%d recipes', it.uses));
-        imgui.SameLine(cw - 78);
+        imgui.SameLine(cw - 58);
         imgui.Text(string.format('x%d', it.total));
-    end, function (i)
-        local id = list[i].id;
-        imgui.Indent(20);
-        imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.dim);
-        imgui.TextWrapped(where_text(id));
-        imgui.PopStyleColor(1);
+    end, function () end);
+    imgui.EndChild();
+    imgui.TextColored(COLOR.dim, string.format('%d items', #state.items));
+end
 
-        local used = {};
-        for _, r in ipairs(uses[id] or {}) do
-            if cfg.eras[r.era] and (cfg.desynth or not r.desynth) then used[#used + 1] = r; end
-        end
-        table.sort(used, function (a, b)
-            if a.status ~= b.status then return a.status < b.status; end
-            if a.missing ~= b.missing then return a.missing < b.missing; end
-            if a.level ~= b.level then return a.level < b.level; end
-            return a.id < b.id;
-        end);
-        for n, r in ipairs(used) do
-            if n > 60 then
-                imgui.TextColored(COLOR.dim, string.format('... and %d more', #used - 60));
-                break;
-            end
-            if draw_recipe_row(r, false, cw, 'u') then jump = r; end
-        end
-        imgui.Unindent(20);
-        imgui.Separator();
+local function draw_item_detail(dw)
+    local id = state.selected_item;
+    if id == nil then
+        imgui.TextColored(COLOR.dim, 'Pick an item on the left.');
+        draw_close_button(dw);
+        imgui.TextColored(COLOR.dim, 'You will see where it is and which recipes use it.');
+        return;
+    end
+
+    font_scale(1.45);
+    imgui.TextColored(COLOR.text_main or COLOR.head, short_name(item_name(id), 26));
+    font_scale(1.0);
+    draw_close_button(dw);
+
+    imgui.TextColored(COLOR.head, 'WHERE IT IS');
+    imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.dim);
+    imgui.TextWrapped(where_text(id));
+    imgui.PopStyleColor(1);
+
+    local used = {};
+    for _, r in ipairs(uses[id] or {}) do
+        if cfg.eras[r.era] and (cfg.desynth or not r.desynth) then used[#used + 1] = r; end
+    end
+    table.sort(used, function (a, b)
+        if a.status ~= b.status then return a.status < b.status; end
+        if a.missing ~= b.missing then return a.missing < b.missing; end
+        if a.level ~= b.level then return a.level < b.level; end
+        return a.id < b.id;
     end);
+
+    imgui.TextColored(COLOR.head, string.format('USED IN %d RECIPES', #used));
+    imgui.TextColored(COLOR.dim, 'Click one to open it.');
+    imgui.BeginChild('##item_recipes', { 0, 0 }, false);
+    local cw = window_width(dw - 16);
+    local jump = nil;
+    expanding_list('item_recipes', #used, nil, function (i)
+        if draw_recipe_row(used[i], false, cw, 'u', true) then jump = used[i]; end
+    end, function () end);
     imgui.EndChild();
 
-    imgui.Separator();
-    imgui.TextColored(COLOR.dim, string.format('%d item(s) - click a recipe under an item to open it', #state.items));
-
-    -- Clicking a recipe under an item opens it on the Recipes tab.
+    -- Clicking a recipe opens it on the Recipes tab.
     if jump ~= nil then
         state.tab = 1;
         state.search[1] = jump.name;
-        cfg.show_mode = #SHOW_MODES;
-        cfg.craft, cfg.level = 0, 0;
         state.selected = jump;
         state.dirty = true;
     end
 end
 
-local function draw_settings_tab()
+----------------------------------------------------------------------------------------------------
+-- Settings tab
+----------------------------------------------------------------------------------------------------
+
+local function draw_settings(dw)
     local changed, c = false, false;
 
-    imgui.TextColored(COLOR.head, 'Look');
+    imgui.TextColored(COLOR.head, 'LOOK');
+    draw_close_button(dw);
     imgui.PushItemWidth(180);
     cfg.theme, c = combo('Theme', cfg.theme, THEME_NAMES, 'Plain (Ashita default)'); changed = changed or c;
     if cfg.theme ~= 0 then
@@ -936,7 +1101,7 @@ local function draw_settings_tab()
     imgui.PopItemWidth();
 
     imgui.Separator();
-    imgui.TextColored(COLOR.head, 'Recipes');
+    imgui.TextColored(COLOR.head, 'RECIPES');
     cfg.desynth, c = checkbox('Show desynthesis recipes', cfg.desynth); changed = changed or c;
     cfg.hide_no_ki, c = checkbox('Hide recipes needing a key item I lack', cfg.hide_no_ki); changed = changed or c;
     cfg.skill_limit, c = checkbox('Hide recipes too far above my skill', cfg.skill_limit); changed = changed or c;
@@ -949,20 +1114,20 @@ local function draw_settings_tab()
     end
 
     imgui.Separator();
-    imgui.TextColored(COLOR.head, 'Expansions to include');
+    imgui.TextColored(COLOR.head, 'EXPANSIONS TO INCLUDE');
     for i, era in ipairs(ERAS) do
         cfg.eras[era.key], c = checkbox(era.name, cfg.eras[era.key]); changed = changed or c;
-        if i % 2 == 1 and i ~= #ERAS then imgui.SameLine(220); end
+        if i % 2 == 1 and i ~= #ERAS then imgui.SameLine(230); end
     end
 
     imgui.Separator();
-    imgui.TextColored(COLOR.head, 'Bags to search');
+    imgui.TextColored(COLOR.head, 'BAGS TO SEARCH');
     local rescan = false;
     for i, bag in ipairs(BAGS) do
         local key = 'b' .. bag.id;
         cfg.bags[key], c = checkbox(bag.name, cfg.bags[key] ~= false);
         if c then changed = true; rescan = true; end
-        if i % 3 ~= 0 and i ~= #BAGS then imgui.SameLine(((i % 3) * 140) + 12); end
+        if i % 3 ~= 0 and i ~= #BAGS then imgui.SameLine(((i % 3) * 170) + 12); end
     end
 
     if changed then
@@ -973,10 +1138,14 @@ local function draw_settings_tab()
     if rescan then refresh(); end
 end
 
+----------------------------------------------------------------------------------------------------
+-- Window
+----------------------------------------------------------------------------------------------------
+
 local TABS = { 'Recipes', 'Items', 'Settings' };
 local TAB_WIDTH = { 58, 42, 62 };
 
-local function draw_header(w)
+local function draw_header()
     imgui.TextColored(COLOR.head, 'Craftbook');
     for i, name in ipairs(TABS) do
         imgui.SameLine();
@@ -984,11 +1153,6 @@ local function draw_header(w)
         if not active then imgui.PushStyleColor(flag('ImGuiCol_Text'), COLOR.dim); end
         if imgui.Selectable(name .. '##tab', active, 0, { TAB_WIDTH[i], 0 }) then state.tab = i; end
         if not active then imgui.PopStyleColor(1); end
-    end
-    imgui.SameLine(w - 32);
-    if imgui.SmallButton('x##close') then
-        cfg.visible = false;
-        settings.save();
     end
     imgui.Separator();
 end
@@ -1003,17 +1167,40 @@ local function draw()
     end
 
     local pushed_colors, pushed_vars = push_theme();
-    imgui.SetNextWindowSize({ 460, 560 }, flag('ImGuiCond_FirstUseEver'));
-    if imgui.Begin('Craftbook##craftbook_compact', nil, flag('ImGuiWindowFlags_NoTitleBar')) then
-        local w = window_width(460);
-        draw_header(w);
+    imgui.SetNextWindowSize({ 880, 560 }, flag('ImGuiCond_FirstUseEver'));
+    if imgui.Begin('Craftbook##craftbook_workshop', nil, flag('ImGuiWindowFlags_NoTitleBar')) then
+        -- Left pane: tabs, filters and the list.
+        imgui.BeginChild('##left', { LEFT_WIDTH, 0 }, true);
+        draw_header();
         if state.tab == 2 then
-            draw_items_tab(w);
+            draw_item_list(LEFT_WIDTH);
         elseif state.tab == 3 then
-            draw_settings_tab();
+            imgui.TextColored(COLOR.dim, 'Settings are on the right.');
         else
-            draw_recipes_tab(w);
+            draw_recipe_list(LEFT_WIDTH);
         end
+        imgui.EndChild();
+
+        imgui.SameLine();
+
+        -- Right pane: details for whatever is picked on the left.
+        imgui.PushStyleColor(flag('ImGuiCol_ChildBg'), { 0, 0, 0, 0 });
+        imgui.BeginChild('##right', { 0, 0 }, false);
+        imgui.PopStyleColor(1);
+        local dw = window_width(560);
+        if state.tab == 2 then
+            draw_item_detail(dw);
+        elseif state.tab == 3 then
+            draw_settings(dw);
+        elseif state.selected ~= nil then
+            draw_recipe_detail(state.selected, dw);
+        else
+            imgui.TextColored(COLOR.dim, 'Pick a recipe on the left,');
+            draw_close_button(dw);
+            imgui.TextColored(COLOR.dim, 'or type what you want to make in the search box.');
+            imgui.TextColored(COLOR.dim, 'Open a craft with [+] to see its recipes.');
+        end
+        imgui.EndChild();
     end
     imgui.End();
     pop_theme(pushed_colors, pushed_vars);
@@ -1028,6 +1215,7 @@ local function apply_settings(s)
     -- Fill in anything missing from older settings files.
     cfg.bags = cfg.bags or T{};
     cfg.eras = cfg.eras or T{};
+    cfg.open_crafts = cfg.open_crafts or T{};
     for k, v in pairs(default_settings.eras) do
         if cfg.eras[k] == nil then cfg.eras[k] = v; end
     end

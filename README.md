@@ -22,11 +22,14 @@ Commands
 
 Using it
 --------
-Find recipe   type the name of anything you want to craft. This searches every recipe,
-              ignoring the dropdowns, and opens the recipe when the name matches exactly.
+Left side     tabs, the search box, filters and the list.
+Find a recipe type the name of anything you want to craft. This searches every recipe,
+              ignoring the dropdowns, and opens it when the name matches exactly.
+Craft groups  with "All crafts" picked, recipes sit under a header per craft.
+              Click [+] Bonecraft (etc.) to open it, [-] to close it.
 Dropdowns     what to show (ready / have everything / missing 1 or 2 / all), craft, level band.
-Click a row   opens it: each ingredient with  have / need  and which bag it is in.
-              Click it again to close it.
+Right side    the recipe you picked: have / need and the bags for each ingredient,
+              how many you can make, and a TO DO list (what to move, what to get).
 Drag          drag the window by any empty part of it. Drag the bottom-right corner to resize.
 
 Colours
@@ -38,7 +41,7 @@ Red     something is missing ("need 2" = two ingredients short)
 Tabs
 ----
 Recipes   described above
-Items     everything you own, where it is, and the recipes that use it (click one to open it)
+Items     everything you own: pick one to see where it is and the recipes that use it
 Settings  theme and background opacity, which bags to search, which expansions to include,
           desynths, skill limit
 
